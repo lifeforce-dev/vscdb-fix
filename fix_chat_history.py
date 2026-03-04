@@ -6,9 +6,9 @@ VS Code Chat History Repair Tool
 Fixes missing chat sessions in VS Code by rebuilding the session index.
 
 Problem:
-- Chat session files exist in: chatSessions/*.json
+- Chat session files exist in: chatSessions/*.json or chatSessions/*.jsonl
 - But they don't appear in VS Code's UI
-- Because they're missing from: state.vscdb → chat.ChatSessionStore.index
+- Because they're missing from: state.vscdb -> chat.ChatSessionStore.index
 
 Solution:
 - Scans session JSON files
@@ -130,10 +130,12 @@ class WorkspaceInfo:
             except:
                 pass
 
-        # Get session IDs from disk
+        # Get session IDs from disk (both .json and .jsonl formats).
         self.sessions_on_disk: Set[str] = set()
         if self.sessions_dir.exists():
             for session_file in self.sessions_dir.glob("*.json"):
+                self.sessions_on_disk.add(session_file.stem)
+            for session_file in self.sessions_dir.glob("*.jsonl"):
                 self.sessions_on_disk.add(session_file.stem)
 
         # Get session IDs from index
@@ -173,6 +175,16 @@ class WorkspaceInfo:
         # Fallback to "Unknown"
         return f"Unknown ({self.id[:8]}...)"
 
+    def get_session_path(self, session_id: str) -> Optional[Path]:
+        """Return the path to a session file, checking .jsonl first then .json."""
+        jsonl_path = self.sessions_dir / f"{session_id}.jsonl"
+        if jsonl_path.exists():
+            return jsonl_path
+        json_path = self.sessions_dir / f"{session_id}.json"
+        if json_path.exists():
+            return json_path
+        return None
+
     @property
     def missing_from_index(self) -> Set[str]:
         """Session files that exist but aren't in the index."""
@@ -211,6 +223,108 @@ def scan_workspaces() -> List[WorkspaceInfo]:
                 print(f"⚠️  Warning: Failed to scan {workspace_dir.name}: {e}")
 
     return workspaces
+
+def extract_session_metadata(session_path: Path, session_id: str) -> Dict:
+    """Extract title, timestamp, and other metadata from a session file.
+
+    Handles both the old single-JSON format and the newer JSONL format.
+    Returns a dict suitable for use as an index entry.
+    """
+    title = "Untitled Session"
+    last_message_date = 0
+    creation_date = 0
+    is_empty = True
+    initial_location = "panel"
+    has_pending_edits = False
+
+    try:
+        if session_path.suffix == ".jsonl":
+            with open(session_path, "r", encoding="utf-8") as f:
+                first_line = f.readline().strip()
+            if first_line:
+                header = json.loads(first_line)
+                v = header.get("v", {})
+                initial_location = v.get("initialLocation", "panel")
+                creation_date = v.get("creationDate", 0)
+                has_pending_edits = v.get("hasPendingEdits", False)
+
+                requests = v.get("requests", [])
+                if isinstance(requests, list) and requests:
+                    is_empty = False
+                    first_req = requests[0]
+                    msg = first_req.get("message", {})
+                    parts = msg.get("parts", [])
+                    text_parts = [
+                        p.get("text", "")
+                        for p in parts
+                        if isinstance(p, dict) and "text" in p
+                    ]
+                    if text_parts:
+                        title = text_parts[0].strip()
+                        if len(title) > 100:
+                            title = title[:97] + "..."
+                        if not title:
+                            title = "Untitled Session"
+
+                    last_req = requests[-1]
+                    last_message_date = last_req.get("timestamp", 0)
+        else:
+            with open(session_path, "r", encoding="utf-8") as f:
+                session_data = json.load(f)
+
+            initial_location = session_data.get("initialLocation", "panel")
+            creation_date = session_data.get("creationDate", 0)
+            has_pending_edits = session_data.get("hasPendingEdits", False)
+
+            requests = session_data.get("requests", [])
+            if requests:
+                is_empty = False
+                first_req = requests[0]
+                msg = first_req.get("message", {})
+                parts = msg.get("parts", [])
+                text_parts = [
+                    p.get("text", "")
+                    for p in parts
+                    if isinstance(p, dict) and "text" in p
+                ]
+                if text_parts:
+                    title = text_parts[0].strip()
+                    if len(title) > 100:
+                        title = title[:97] + "..."
+                    if not title:
+                        title = "Untitled Session"
+
+                last_req = requests[-1]
+                last_message_date = last_req.get("timestamp", 0)
+    except Exception:
+        pass
+
+    if not last_message_date and creation_date:
+        last_message_date = creation_date
+
+    # Build the index entry. Newer VS Code uses additional fields.
+    entry: Dict = {
+        "sessionId": session_id,
+        "title": title,
+        "lastMessageDate": last_message_date,
+        "initialLocation": initial_location,
+        "isEmpty": is_empty,
+    }
+
+    # JSONL sessions use the newer index format with extra fields.
+    if session_path.suffix == ".jsonl":
+        timing: Dict = {}
+        if creation_date:
+            timing["created"] = creation_date
+        entry["timing"] = timing
+        entry["hasPendingEdits"] = has_pending_edits
+        entry["isExternal"] = False
+        entry["lastResponseState"] = 1
+    else:
+        entry["isImported"] = False
+
+    return entry
+
 
 def find_orphan_in_other_workspaces(session_id: str, current_workspace: WorkspaceInfo, all_workspaces: List[WorkspaceInfo]) -> Optional[Dict]:
     """Check if an orphaned session ID exists as a file in another workspace.
@@ -257,58 +371,25 @@ def repair_workspace(workspace: WorkspaceInfo, dry_run: bool = False, show_detai
                 pass
 
         for session_id in sorted(workspace.sessions_on_disk):
-            session_file = workspace.sessions_dir / f"{session_id}.json"
+            session_path = workspace.get_session_path(session_id)
+            if not session_path:
+                print(f"      Warning: No file found for session {session_id}")
+                continue
 
             try:
-                with open(session_file, 'r', encoding='utf-8') as f:
-                    session_data = json.load(f)
+                entry = extract_session_metadata(session_path, session_id)
+                entries[session_id] = entry
 
-                # Extract metadata
-                title = "Untitled Session"
-                last_message_date = 0
-                is_empty = True
-
-                if "requests" in session_data and session_data["requests"]:
-                    is_empty = False
-                    first_request = session_data["requests"][0]
-
-                    # Extract title from message parts
-                    if "message" in first_request and "parts" in first_request["message"]:
-                        text_parts = [
-                            p.get("text", "")
-                            for p in first_request["message"]["parts"]
-                            if "text" in p
-                        ]
-                        if text_parts:
-                            title = text_parts[0].strip()
-                            if len(title) > 100:
-                                title = title[:97] + "..."
-                            if not title:
-                                title = "Untitled Session"
-
-                    # Get timestamp from last request
-                    last_request = session_data["requests"][-1]
-                    last_message_date = last_request.get("timestamp", 0)
-
-                entries[session_id] = {
-                    "sessionId": session_id,
-                    "title": title,
-                    "lastMessageDate": last_message_date,
-                    "isImported": False,
-                    "initialLocation": session_data.get("initialLocation", "panel"),
-                    "isEmpty": is_empty
-                }
-
-                # Track if this session will be restored
+                # Track if this session will be restored.
                 if session_id in workspace.missing_from_index:
                     result['restored_sessions'].append({
                         'id': session_id,
-                        'title': title,
-                        'date': last_message_date
+                        'title': entry['title'],
+                        'date': entry['lastMessageDate']
                     })
 
             except Exception as e:
-                print(f"      ⚠️  Failed to read {session_id}: {e}")
+                print(f"      Warning: Failed to read {session_id}: {e}")
 
         if not dry_run:
             # Create backup
@@ -487,8 +568,11 @@ def repair_single_workspace(workspace_id: str, dry_run: bool, remove_orphans: bo
         
         for session_id, found_info in recoverable_orphans.items():
             found_ws = found_info['workspace']
-            source_file = found_ws.sessions_dir / f"{session_id}.json"
-            target_file = workspace.sessions_dir / f"{session_id}.json"
+            source_file = found_ws.get_session_path(session_id)
+            if not source_file:
+                print(f"   Warning: Source file for {session_id[:8]}... not found")
+                continue
+            target_file = workspace.sessions_dir / source_file.name
             
             try:
                 shutil.copy2(source_file, target_file)
@@ -670,8 +754,11 @@ def repair_all_workspaces(dry_run: bool, auto_yes: bool, remove_orphans: bool, r
             target_ws.sessions_dir.mkdir(parents=True, exist_ok=True)
             
             for session_id, source_ws in sessions_to_recover:
-                source_file = source_ws.sessions_dir / f"{session_id}.json"
-                target_file = target_ws.sessions_dir / f"{session_id}.json"
+                source_file = source_ws.get_session_path(session_id)
+                if not source_file:
+                    print(f"      Warning: Source file for {session_id[:8]}... not found")
+                    continue
+                target_file = target_ws.sessions_dir / source_file.name
                 
                 try:
                     shutil.copy2(source_file, target_file)

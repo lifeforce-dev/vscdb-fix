@@ -40,13 +40,17 @@ VS Code's core chat service (not the GitHub Copilot extension) manages regular c
 ├── state.vscdb                    # SQLite database
 │   └── chat.ChatSessionStore.index  # Index of all sessions
 └── chatSessions/
-    ├── session-1.json             # Your actual chat data
-    ├── session-2.json
-    └── session-3.json
+    ├── session-1.json             # Legacy format (single JSON blob)
+    ├── session-2.jsonl            # Current format (JSON Lines, incremental)
+    └── session-3.jsonl
 ```
 
+**Session File Formats:**
+- **Legacy `.json`**: A single JSON object containing all requests, metadata, and responses.
+- **Current `.jsonl`**: JSON Lines format. Line 0 (`kind: 0`) is the session header with requests array. Subsequent lines (`kind: 1`, `kind: 2`) are incremental updates.
+
 **Session Creation Process:**
-1. Full conversation stored as JSON in `chatSessions/`
+1. Full conversation stored in `chatSessions/` (`.json` or `.jsonl`)
 2. Index entry added to `state.vscdb` with metadata (title, timestamp, location)
 
 **Session Restoration Process:**
@@ -67,8 +71,8 @@ The index in `state.vscdb` can become corrupted or out of sync with actual sessi
 ### Repair Process
 
 The tool performs the following operations:
-1. Scans `chatSessions/` directory for all session JSON files
-2. Extracts metadata from each session file
+1. Scans `chatSessions/` directory for all session files (both `.json` and `.jsonl`)
+2. Extracts metadata from each session file (format-aware parsing)
 3. Rebuilds `chat.ChatSessionStore.index` in `state.vscdb`
 4. Creates timestamped backup before modifications
 
